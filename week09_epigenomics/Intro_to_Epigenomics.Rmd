@@ -1,0 +1,151 @@
+---
+title: "Methylation Q1"
+author: "William Jewell"
+date: "2026-03-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = normalizePath("/home1/wfjewell/490_cluster/analysis_data"))
+```
+
+```{r}
+if (!require("sesameData", quietly = TRUE))
+BiocManager::install("sesameData")
+
+if (!require("sesame", quietly = TRUE))
+BiocManager::install("sesame")
+
+if (!require("limma", quietly = TRUE))
+BiocManager::install("limma")
+
+library(TCGAbiolinks)
+library(sesame)
+library(sesameData)
+library(limma)
+library(ggplot2)
+```
+
+```{r}
+query <- GDCquery(
+  project = "TCGA-BRCA",
+  data.category = "DNA Methylation",
+  data.type = "Methylation Beta Value",
+  platform = "Illumina Human Methylation 450",
+  data.format = "Dataframe"
+)
+
+GDCdownload(query, method = "api", files.per.chunk = 10)
+methylation450 <- GDCprepare(query)
+```
+
+```{r}
+methylation_clinical <- as.data.frame(methylation450@colData)
+betas <- as.data.frame(methylation450@assays@data@listData) #takes a longer time
+cpg_sites <- as.data.frame(methylation450@rowRanges@elementMetadata)
+column_mask <- ifelse(colnames(methylation_clinical) %in% c('treatments', 'primary_site', 'disease_type','sites_of_involvement'), F, T)
+methylation_clinical <- methylation_clinical[,column_mask]
+write.csv(methylation_clinical, 'brca_methylation_clinical.csv')
+site_mask <- !grepl('-', cpg_sites$gene) & !grepl(';', cpg_sites$gene) & !is.na(cpg_sites$gene) & complete.cases(betas)
+betas <- betas[site_mask,]
+cpg_sites <- cpg_sites[site_mask,]
+write.csv(betas, 'brca_methylation_betas.csv')
+write.csv(cpg_sites, 'brca_cpg_sites.csv')
+```
+
+```{r}
+meth_mask <- methylation_clinical$definition %in% c("Metastatic", "Primary solid Tumor")
+methylation_clinical <- methylation_clinical[meth_mask, ]
+betas_clean <- betas[, meth_mask]
+methylation_clinical$is_metastatic <- methylation_clinical$definition == "Metastatic"
+non_metastatic_mask <- methylation_clinical$metastatic_status == "Non-Metastatic"
+mval <- t(apply(betas_clean, 1, function(x) log2(x/(1-x))))
+design <- model.matrix(~is_metastatic, data = methylation_clinical)
+fit <- lmFit(mval, design)
+fit2 <- eBayes(fit)
+```
+
+```{r}
+dat <- data.frame(foldchange = fit[["coefficients"]][,2], logPvalue =  -log10(p.adjust(fit2[["p.value"]][,2],method='BY')), geneName = cpg_sites$gene)
+dat$threshold <- as.factor(abs(dat$foldchange) < 1)
+colnames(betas_clean) <- gsub("\\.", "-", colnames(betas_clean))
+cols <- c("TRUE" = "grey", "FALSE" = "blue")
+ggplot(data=dat, aes(x=foldchange, y = logPvalue)) +
+  geom_point(alpha=.2, size=0.6) +
+  scale_colour_manual(values = cols) +
+  geom_vline(xintercept = 1, colour="#990000", linetype="dashed") + 
+  geom_vline(xintercept = - 1, colour="#990000", linetype="dashed") +
+  geom_hline(yintercept = 2, colour = "#990000", linetype="dashed") +
+  theme(legend.position="none") +
+  xlab("Fold Change") +
+  ylab("-log10 p value") +
+  theme_bw() +
+  theme(legend.position = "none")
+```
+
+```{r}
+write.csv(dat, "methylation_results_metastasis.csv")
+```
+
+Analysis: 
+
+The volcano plot indicates that most CpG sites do not show significant methylation differences between metastatic and non-metastatic patients, as most points fall below the significance threshold. Among the significant sites, there are more hypomethylated CpG sites in the upper left than hypermethylated sites in the upper right, suggesting that metastatic patients tend to lose methylation rather than gain it. Overall, these results suggest that hypomethylation may play a role in metastatic breast cancer.
+
+Part 2:
+```{r}
+de_results <- read.csv("deSeq_results_age.csv")
+
+rna_clinical <- read.csv("brca_rna_clinical_data.csv", row.names = 1)
+rna_genes <- read.csv("brca_rna_gene_data.csv")
+rna_counts <- read.csv("brca_rna_count_data.csv", row.names = 1)
+```
+
+```{r}
+GENE<-"MMP14"
+
+gene_counts_mask <- rna_genes$gene_name == GENE
+gene_betas_mask <- cpg_sites$gene == GENE
+```
+
+```{r}
+rna_clinical_old <- rna_clinical$age_category == "old"
+methylation_clinical_old <- methylation_clinical$age_category == "old"
+rna_clinical_young <- rna_clinical$age_category == "young"
+methylation_clinical_young <- methylation_clinical$age_category == "young"
+rna_old <- as.numeric(rna_counts[gene_counts_mask, rna_clinical_old])
+methylation_old <- (betas[gene_betas_mask, methylation_clinical_old])
+rna_young <- as.numeric(rna_counts[gene_counts_mask, rna_clinical_young])
+methylation_young <- (betas[gene_betas_mask, methylation_clinical_young])
+```
+
+```{r}
+boxplot(rna_young, rna_old, xlab='Group', ylab='Counts', names=c('young', 'old'),
+        col=c("blue","red"))
+
+plot(1:dim(methylation_young)[1], apply(methylation_young, 1, mean), col='blue', type='h', lwd=3, ylab='Average Beta', xlab='CpG sites')
+
+lines(1.3:(dim(methylation_old)[1]+0.3), apply(methylation_old, 1, mean), col='red', type='h', lwd=3)
+
+legend("topright",
+       legend=c("Young", "Old"),
+       col=c("blue", "red"),
+       lwd=3,
+       cex=0.7)
+```
+
+Analysis:
+The box plot shows that MMP14 RNA expression is signifiacntly higher in non-metastatic patients than in metastatic patients.
+
+Part 3:
+
+MMP14:
+Encodes a membrane-bound enzyme which helps breakdown extracellular matrix components. MMP14 also plays a key role in tissue remodeling, cell migration, and angiogenesis. However, it promotes metastasis due to degrading surroudning matrix barriers.
+
+TP53:
+Tumor suppressor gene that helps regulate the cell cycle and prevent genomic instability. Mutations in TP53 are very common in cancers.
+
+BRCA1:
+Tumor suppressor gene involved in DNA damage repair. Mutations in BRCA1 significantly increase the risk of ovarian and breast cancer.
+
+Literature:
+A 2015 study by Yoshifumi Itoh highlights MMP14's role in regulating tumor invasion, angiogenesis, and metastasis. This study also explains how MMP14 can remodel the extracellular enviornment and facilitate cancer cell migration. This supports my previous analysis on MMP14 that there are lower expressions of MMP14 in metastatic cases as an attempt to fight the cancer.
